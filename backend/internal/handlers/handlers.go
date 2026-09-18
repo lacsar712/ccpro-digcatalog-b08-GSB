@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"encoding/csv"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -311,20 +313,121 @@ func parseDate(s *string) *time.Time {
 	return &t
 }
 
+// findFilters 是文物列表与 CSV 导出共用的筛选条件。
+type findFilters struct {
+	unitID       string
+	artifactType string
+	findDateFrom *time.Time
+	findDateTo   *time.Time
+}
+
+// parseFindFilters 解析查询参数；日期须为 YYYY-MM-DD，非法日期返回错误（由调用方转 400）。
+func parseFindFilters(c *gin.Context) (*findFilters, error) {
+	f := &findFilters{
+		unitID:       c.Query("unitId"),
+		artifactType: c.Query("artifactType"),
+	}
+	if s := c.Query("findDateFrom"); s != "" {
+		t, err := time.Parse("2006-01-02", s)
+		if err != nil {
+			return nil, fmt.Errorf("findDateFrom 日期格式无效，应为 YYYY-MM-DD")
+		}
+		f.findDateFrom = &t
+	}
+	if s := c.Query("findDateTo"); s != "" {
+		t, err := time.Parse("2006-01-02", s)
+		if err != nil {
+			return nil, fmt.Errorf("findDateTo 日期格式无效，应为 YYYY-MM-DD")
+		}
+		f.findDateTo = &t
+	}
+	if f.findDateFrom != nil && f.findDateTo != nil && f.findDateFrom.After(*f.findDateTo) {
+		return nil, fmt.Errorf("findDateFrom 不能晚于 findDateTo")
+	}
+	return f, nil
+}
+
+func (f *findFilters) apply(q *gorm.DB) *gorm.DB {
+	if f.unitID != "" {
+		q = q.Where("unit_id = ?", f.unitID)
+	}
+	if f.artifactType != "" {
+		q = q.Where("artifact_type = ?", f.artifactType)
+	}
+	if f.findDateFrom != nil {
+		q = q.Where("find_date >= ?", f.findDateFrom.Format("2006-01-02"))
+	}
+	if f.findDateTo != nil {
+		q = q.Where("find_date <= ?", f.findDateTo.Format("2006-01-02"))
+	}
+	return q
+}
+
 func (h *Handler) ListFinds(c *gin.Context) {
+	filters, err := parseFindFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	var finds []models.Find
-	q := h.DB.Preload("Unit").Preload("Unit.Site").Preload("Material").Order("id desc")
-	if unitID := c.Query("unitId"); unitID != "" {
-		q = q.Where("unit_id = ?", unitID)
-	}
-	if at := c.Query("artifactType"); at != "" {
-		q = q.Where("artifact_type = ?", at)
-	}
+	q := filters.apply(h.DB.Preload("Unit").Preload("Unit.Site").Preload("Material").Order("id desc"))
 	if err := q.Find(&finds).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, finds)
+}
+
+// ExportFinds 以 CSV 导出当前筛选结果，筛选参数与列表接口完全一致。
+// 文件带 UTF-8 BOM，Excel 可直接打开；空结果集时仅输出表头一行。
+func (h *Handler) ExportFinds(c *gin.Context) {
+	filters, err := parseFindFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var finds []models.Find
+	q := filters.apply(h.DB.Preload("Unit").Preload("Material").Order("id asc"))
+	if err := q.Find(&finds).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	filename := "finds-" + time.Now().Format("20060102") + ".csv"
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+
+	// UTF-8 BOM，保证 Excel 正确识别中文编码
+	if _, err := c.Writer.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+		return
+	}
+
+	w := csv.NewWriter(c.Writer)
+	_ = w.Write([]string{"registerNo", "artifactType", "unitCode", "materialName", "completeness", "findDate", "storageLoc"})
+	for _, f := range finds {
+		unitCode := ""
+		if f.Unit != nil {
+			unitCode = f.Unit.Code
+		}
+		materialName := f.MaterialName
+		if materialName == "" && f.Material != nil {
+			materialName = f.Material.Name
+		}
+		findDate := ""
+		if f.FindDate != nil {
+			findDate = f.FindDate.Format("2006-01-02")
+		}
+		_ = w.Write([]string{
+			f.RegisterNo,
+			f.ArtifactType,
+			unitCode,
+			materialName,
+			f.Completeness,
+			findDate,
+			f.StorageLoc,
+		})
+	}
+	w.Flush()
 }
 
 func (h *Handler) GetFind(c *gin.Context) {

@@ -60,6 +60,7 @@ docker compose up --build
 - `GET|POST|PUT|DELETE /api/sites`
 - `GET|POST|PUT|DELETE /api/units`
 - `GET|POST|PUT|DELETE /api/finds`
+- `GET /api/finds/export.csv` — 按列表相同筛选参数（`unitId`、`artifactType`、`findDateFrom`、`findDateTo`）导出 CSV，UTF-8 含 BOM；日期格式非法返回 400
 - `GET|POST|PUT|DELETE /api/materials`
 - `GET /api/overview`
 
