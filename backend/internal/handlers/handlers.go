@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"encoding/csv"
 	"net/http"
 	"strconv"
 	"time"
@@ -311,20 +313,96 @@ func parseDate(s *string) *time.Time {
 	return &t
 }
 
-func (h *Handler) ListFinds(c *gin.Context) {
-	var finds []models.Find
-	q := h.DB.Preload("Unit").Preload("Unit.Site").Preload("Material").Order("id desc")
+// applyFindFilters 应用与文物列表一致的筛选参数。
+// 返回 false 表示参数非法（已写入错误响应），调用方应直接返回。
+func (h *Handler) applyFindFilters(c *gin.Context, q *gorm.DB) (*gorm.DB, bool) {
 	if unitID := c.Query("unitId"); unitID != "" {
 		q = q.Where("unit_id = ?", unitID)
 	}
 	if at := c.Query("artifactType"); at != "" {
 		q = q.Where("artifact_type = ?", at)
 	}
+	if fd := c.Query("findDate"); fd != "" {
+		t, err := time.Parse("2006-01-02", fd)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "出土日期格式无效，应为 YYYY-MM-DD"})
+			return nil, false
+		}
+		// 用半开区间匹配当天，兼容 date 与 datetime 存储
+		q = q.Where("find_date >= ? AND find_date < ?", t, t.AddDate(0, 0, 1))
+	}
+	return q, true
+}
+
+func (h *Handler) ListFinds(c *gin.Context) {
+	var finds []models.Find
+	q := h.DB.Preload("Unit").Preload("Unit.Site").Preload("Material").Order("id desc")
+	q, ok := h.applyFindFilters(c, q)
+	if !ok {
+		return
+	}
 	if err := q.Find(&finds).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, finds)
+}
+
+// ExportFindsCSV 按与列表相同的筛选条件导出 CSV（UTF-8 BOM，便于 Excel 识别）。
+func (h *Handler) ExportFindsCSV(c *gin.Context) {
+	var finds []models.Find
+	q := h.DB.Preload("Unit").Order("id desc")
+	q, ok := h.applyFindFilters(c, q)
+	if !ok {
+		return
+	}
+	if err := q.Find(&finds).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	headers := []string{"registerNo", "artifactType", "unitCode", "materialName", "completeness", "findDate", "storageLoc"}
+
+	buf := &bytes.Buffer{}
+	// UTF-8 BOM，保证 Excel 直接打开不乱码
+	buf.Write([]byte{0xEF, 0xBB, 0xBF})
+	w := csv.NewWriter(buf)
+	w.UseCRLF = true
+	if err := w.Write(headers); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "导出失败"})
+		return
+	}
+	for _, f := range finds {
+		unitCode := ""
+		if f.Unit != nil {
+			unitCode = f.Unit.Code
+		}
+		findDate := ""
+		if f.FindDate != nil {
+			findDate = f.FindDate.Format("2006-01-02")
+		}
+		if err := w.Write([]string{
+			f.RegisterNo,
+			f.ArtifactType,
+			unitCode,
+			f.MaterialName,
+			f.Completeness,
+			findDate,
+			f.StorageLoc,
+		}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "导出失败"})
+			return
+		}
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "导出失败"})
+		return
+	}
+
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", "attachment; filename=finds-export.csv")
+	c.String(http.StatusOK, buf.String())
 }
 
 func (h *Handler) GetFind(c *gin.Context) {

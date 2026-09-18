@@ -82,6 +82,7 @@ func main() {
 			auth.DELETE("/materials/:id", h.DeleteMaterial)
 
 			auth.GET("/finds", h.ListFinds)
+			auth.GET("/finds/export.csv", h.ExportFindsCSV)
 			auth.GET("/finds/:id", h.GetFind)
 			auth.POST("/finds", h.CreateFind)
 			auth.PUT("/finds/:id", h.UpdateFind)
